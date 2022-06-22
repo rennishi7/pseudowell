@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jan  4 23:32:24 2022
+
+@author: rennishimura
+"""
+
+import geopandas as gpd
+import pandas as pd
+from pandas import DatetimeIndex
+from pandas.tseries.offsets import DateOffset
+import numpy as np
+import datetime as dt
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.backends.backend_pdf import PdfPages
+from k_means_constrained import KMeansConstrained
+from scipy.interpolate import UnivariateSpline
+from scipy import stats
+# For spatial interpolation
+import utils_spatial_nugget0 as utils_spatial
+import os
+# For storage calculation
+import netCDF4 as nc
+import math
+#%%
+lat = 'YCoor'
+lon = 'XCoor'
+var = 'WTE'
+well_id = 'IRH_PEM'
+
+#Loading a file, selecting columns, renaming columns, and adding WTE
+file = '/Users/rennishimura/well_imputation/Sample_Data/EDIT_MI_ZR_Wells_with_Elev.csv'
+df_original = pd.read_csv(file)
+df_original.insert(loc=11, column="Date", value="")
+df_original = df_original[["IRH_PEM", "XCoor", "YCoor","Date","Debut_Fora", "Fin_Forati","Date_Rehab","Niveau_Sta", "Altitude", "Avg_GSE", "ELEV", "WTE"]]
+num_df_original = len(df_original)
+
+# Setting the date based on available date columns.
+# The priority goes from
+# 1. Date_Rehab
+# 2. Fin_Forati (Well Completion Date)
+# 3. Debut_Forati (Well Project/Construction Starting Date)
+date1 = 'Date_Rehab'
+date2 = 'Fin_Forati'
+date3 = 'Debut_Fora'
+for index, row in df_original.iterrows():
+  tempdate1 = row[date1]
+  tempdate2 = row[date2]
+  tempdate3 = row[date3]
+
+  if not pd.isna(tempdate1):
+    df_original.at[index, "Date"] = tempdate1
+  elif not pd.isna(tempdate2):
+    df_original.at[index, "Date"] = tempdate2
+  elif not pd.isna(tempdate3):
+    df_original.at[index, "Date"] = tempdate3
+
+nan_value = float("NaN")
+df_original = df_original.replace("",nan_value)
+df_original = df_original.dropna(subset=["Date"])
+df_original["Date"] = pd.to_datetime(df_original["Date"])
+df_original = df_original.sort_values(by=["Date"], ascending=True)
+num_df_original_date_filtered = len(df_original)
+
+# In python, two-digit year (XX) before 71 (1971) are mapped to 20XX.
+
+
+# This function fixes the date that are older than 100 years and 
+# map to 19XX instead of 20XX.
+def fix_date(x):
+  if x.year > dt.datetime.now().year:
+    year = x.year - 100
+  else:
+    year = x.year
+  return dt.date(year, x.month,x.day)
+
+df_original["Date"] = df_original["Date"].apply(fix_date)
+df_original = df_original.sort_values(by = ["Date"], ascending = False)
+
+#%% Setting the formatted "original_df" to "df"
+df = df_original
+
+#Dropping rows that meet below criteria 
+zero_lat = len(df[df[lat] == 0])
+zero_lon = len(df[df[lon] == 0])
+zero_depth = len(df[df['Niveau_Sta'] == 0])
+print(f'Lat=0: {zero_lat}    Lon=0: {zero_lon}   Depth=0: {zero_depth}')
+#%%
+df = df[(df[lat] != 0) & (df[lon] != 0) & (df['Niveau_Sta'] != 0)]
+
+#Plotting the histgraph based on the dates
+df['Date'] = pd.to_datetime(df['Date'])
+ax = df['WTE'].groupby([df['Date'].dt.year]).count().plot(kind='bar', figsize=(15,6))
+ax.set_ylabel('# of Measurements', fontsize = 18)
+ax.set_xlabel('Date', fontsize = 18)
+ax.set_title(f"Data Distribution in Years ", fontsize = 30)
+ax.set_xticks(ax.get_xticks()[::3])
+plt.xticks(rotation=90, fontsize=15)
+plt.show()
+
+#ax.xaxis.set_major_locator(mdates.YearLocator(base=5))
+#ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y')) 
+#%%
+# Filtering based on "Date" column
+#df = df[df["Date"] >= "1981-01-01"]
+num_cleaned_df = len(df)
+print(f'Original DF: {num_df_original}    No Date Filtered DF: {num_df_original_date_filtered}  Date Filtered DF (e.g. after 1981...): {num_cleaned_df}')
+#%% This cell counts the number of unique well IDs
+# For Niger's dataset, the "Data_Points" should be 1 for all the (unique) wells
+list_uni_wells = list(df[well_id].unique())
+df_uni_wells = pd.DataFrame()
+
+for uniwell in list_uni_wells:
+    df_temp = df[df[well_id] == uniwell]
+    df_temp['Data_Points'] = len(df[df[well_id] == uniwell])
+    df_uni_wells = df_uni_wells.append(df_temp)
+
+df_uni_wells = df_uni_wells.drop_duplicates(well_id)
+df_uni_wells = df_uni_wells.sort_values('Data_Points', ascending=True)
+del df_temp
+num_df_uni_wells = len(df_uni_wells)
+print(f'df: {num_cleaned_df}  df_uni_wells: {num_df_uni_wells}')
+#df_uni_wells = df_uni_wells[df_uni_wells['Data_Points'] >1]
+
+# Creating a GeoDataFrame from a DataFrame with coordinates. 
+# Reference:https://geopandas.readthedocs.io/en/latest/gallery/create_geopandas_from_pandas.html
+# Using WGS84 (ESPG: 4326)
+gdf_uni_wells = gpd.GeoDataFrame(df_uni_wells, crs=4326, geometry=gpd.points_from_xy(df_uni_wells[lon], df_uni_wells[lat])) 
+#%% Loading shapefiles for Niger country boundary and our study aquifer
+basefile = "/Users/rennishimura/Documents/!Research/Pseudo_Wells_QGIS/Niger_Country/Niger_Country_Boundary.shp"
+aquiferfile = '/Users/rennishimura/Documents/!Research/Pseudo_Wells_QGIS/Aquifer/Small_South_Aquifer/Niger_Small_South.shp'
+basemap = gpd.read_file(basefile)
+aquifermap = gpd.read_file(aquiferfile)
+basemap = basemap.to_crs(crs=4326)
+aquifermap = aquifermap.to_crs(crs=4326)
+#%% Plotting the figure of pseudo-wells and wells around the aquifer of interest
+# Reprojecting gdf to WGS84
+aquifermap = aquifermap.to_crs(crs=4326)
+# Buffer the aquifer 50km based on the Web Marcator (3857) and reprojecting back to WGS84 (4326)
+aquifermap_buffered = aquifermap.to_crs(crs=3857).buffer(20*1e3).to_crs(4326)
+# Clipping the pseudo-wells that are within the buffered aquifer
+gdf_uni_wells_clip = ((gpd.clip(gdf_uni_wells, aquifermap_buffered))
+                      .set_index("Date")
+                      .sort_index()
+                      )
+#%% Clustering algorithm using K-mean-constrained
+df_tempcluster = gdf_uni_wells_clip[[lat,lon]]
+
+wellsize = len(df_tempcluster)
+#========================================SET CLUSTER SIZE================================================================================
+min_wells_in_cluster = 25
+size_min_option = 1
+'''
+Parameter for size_min_option:
+    1: x
+    2: x*2: More constrained clustering
+'''
+if size_min_option == 1: size_min = min_wells_in_cluster
+else: size_min = np.ceil(min_wells_in_cluster*2).astype(int)
+#========================================SET CLUSTER SIZE================================================================================
+clustersize = int(np.floor(wellsize/min_wells_in_cluster/2))
+print('Cluster size is ' + str(clustersize))
+
+clf = KMeansConstrained(
+     n_clusters=clustersize,
+     size_min= size_min,
+     #size_max=min_wells_in_cluster +10,
+     random_state=0)
+clf.fit_predict(df_tempcluster)
+
+gdf_uni_wells_clip['Cluster_Label'] = clf.labels_
+gdf_uni_wells_clip = gdf_uni_wells_clip.sort_values(by='Cluster_Label')
+print('Clustering Fisnihed! Move on!!')
+
+#%% Adding the cluster labels to the time-series dataframe
+df_ts = pd.merge(df, gdf_uni_wells_clip[[well_id,'Cluster_Label']], on=well_id, how='left') 
+gdf_ts = gpd.GeoDataFrame(df_ts, crs=4326, 
+                          geometry=gpd.points_from_xy(df_ts[lon], df_ts[lat])) 
+# Creating a cluster list and assigning a cluster number to the wells
+df_cluster_label = pd.DataFrame()
+list_cluster_label = list(gdf_uni_wells_clip.Cluster_Label.unique())
+#print(list_cluster_label)
+Cluster_Lat, Cluster_Lon = list(zip(*clf.cluster_centers_))
+df_cluster_label['Cluster_Label'] = list_cluster_label
+df_cluster_label['Cluster_Lat'] = Cluster_Lat
+df_cluster_label['Cluster_Lon'] = Cluster_Lon
+
+gdf_cluster_label=gpd.GeoDataFrame(df_cluster_label,geometry=gpd.points_from_xy(df_cluster_label.Cluster_Lon, df_cluster_label.Cluster_Lat), crs=4326)
+
+#%%Checking WTE of all the well in a cluster and removing any wells outside of the standard deviation
+df_ts_std = pd.DataFrame()
+std = 3
+
+list_cluster_label = list(df_ts["Cluster_Label"].unique())
+for cluster in list_cluster_label:
+  df_daily = gdf_uni_wells_clip[gdf_uni_wells_clip['Cluster_Label'] == cluster]
+# =============================================================================
+#   The code below combined these codes into one line
+#   z_scores = stats.zscore(df_daily['WTE'])
+#   z_scores_abs = np.abs(z_scores)
+#   filtered = (z_scores_abs < 2)
+#   df_daily = df_daily[filtered]
+# =============================================================================
+  df_daily_std = df_daily[(np.abs(stats.zscore(df_daily.WTE)) < std)]
+  plot = False
+  if plot:
+      fig, ax = plt.subplots(figsize=(20,10))
+      #ax.set_aspect('equal')
+      df_daily.plot(ax=ax, x="Date", y="WTE", style = ('o-'))
+      plt.title(f'Cluster ID: {cluster}\n' 
+                f'Standard Dev: {std}')
+      df_daily_std.plot(ax=ax, x="Date", y="WTE", style = ('o-'))
+      plt.show()
+  df_ts_std = df_ts_std.append(df_daily_std)
+#%% Plotting the aquifer and the pseudowell locations
+basefile = "/Users/rennishimura/Documents/!Research/Pseudo_Wells_QGIS/Niger_Country/Niger_Country_Boundary.shp"
+aquiferfile = '/Users/rennishimura/Documents/!Research/Pseudo_Wells_QGIS/Aquifer/Small_South_Aquifer/Niger_Small_South.shp'
+
+basemap = gpd.read_file(basefile)
+basemap = basemap.to_crs(crs=4326)
+aquifermap = gpd.read_file(aquiferfile)
+aquifermap = aquifermap.to_crs(crs=4326)
+
+mainfig, ax = plt.subplots(figsize=(9,9))
+ax.set_aspect('equal')
+
+#Setting the basemap 
+basemap.plot(ax=ax, color='lightgrey', edgecolor='black')
+aquifermap.plot(ax=ax, color='lightblue', edgecolor='black')
+
+#Setting the basemap using the grid outter boundary.
+for cluster in list_cluster_label:
+  clusterplot = gdf_ts[gdf_ts['Cluster_Label'] == cluster]
+  #display(clusterplot)
+  clusterplot.plot(ax=ax, markersize=6)
+
+gdf_cluster_label.plot(ax=ax, color='red',marker='o', markersize=15)
+plt.title(f'# of Clusters:  {clustersize} \n'
+          f' # of Wells in Cluster:  {min_wells_in_cluster}'
+          )
+#%% Displaying the aquifer of interest.
+# Buffer the aquifer 10,000km based on the Web Marcator (3857) and reprojecting back to WGS84 (4326)
+aquifermap_buffered = aquifermap.to_crs(crs=3857).buffer(50*1e3).to_crs(4326)
+gdf_cluster_label = gdf_cluster_label.to_crs(crs=4326)
+gdf_cluster_label_clip = gpd.clip(gdf_cluster_label, aquifermap_buffered)
+gdf_ts_clip = gdf_ts[gdf_ts["Cluster_Label"].isin(gdf_cluster_label_clip["Cluster_Label"])]
+
+list_gdf_cluster_label_clip = list(gdf_cluster_label_clip["Cluster_Label"])
+
+smallaquiferfig, ax = plt.subplots(figsize=(9,9))
+#aquifermap_buffered.plot(ax=ax, color='blue')
+aquifermap.plot(ax=ax, color="white")
+aquifermap.boundary.plot(ax=ax, color="black")
+for cluster in list_gdf_cluster_label_clip:
+    temp_gdf_ts_clip = gdf_ts_clip[gdf_ts_clip["Cluster_Label"] == cluster]
+    temp_gdf_ts_clip.plot(ax=ax, markersize=9) 
+#gdf_ts_clip.plot(ax=ax, markersize=1)
+gdf_cluster_label_clip.plot(ax=ax, color="red", markersize=60)
+num_pwells_clip = len(gdf_cluster_label_clip)
+plt.title(f'Number of Pseudo-Wells: {num_pwells_clip}\n'
+          f'Cluster Size: {min_wells_in_cluster} wells',
+          fontsize=18
+          ) 
+plt.show()
+#%% Resampling cluster_df_ts to monthly 
+df_monthly = df_ts_std
+
+df_monthly = (df_monthly
+              .groupby('Cluster_Label') # grouping by clusters
+              .resample('MS').mean().dropna(subset=[var]) # resampling each cluster to monthly average WTE
+              .drop(columns='Cluster_Label')
+              .rename(columns={'WTE':'Monthly_Average_WTE'})
+              .reset_index()
+              )
+#%% PCHIP the time series (ts) dataframe
+df_pchip = pd.DataFrame()
+df_RW1 = pd.DataFrame()
+df_RW2 = pd.DataFrame()
+df_RW3 = pd.DataFrame()
+df_spl = pd.DataFrame()
+df_spl_std = pd.DataFrame()
+df_wte = pd.DataFrame()
+smooth_factor = 10000000
+
+list_cluster_label = list(gdf_cluster_label_clip["Cluster_Label"].unique())
+RWM1 = 24
+RWM2 = 60
+RWM3 = 96
+
+# PCHIP interpolation (monthly) from the monthly average WTE
+for cluster in list_cluster_label:
+    #PCHIP Interpolation  
+    df_select_cluster = df_monthly[df_monthly['Cluster_Label'] == cluster]
+    df_select_cluster.Date = pd.to_datetime(df_select_cluster.Date)
+    # Extending the first and last dates for PCHIP to interpolate and RW to extend 
+    date_old = df_select_cluster["Date"][:1] + DateOffset(months=-48) 
+    date_new = df_select_cluster["Date"][-1:] + DateOffset(months=+48)
+    df_select_cluster = (df_select_cluster
+                         .append(pd.DataFrame({"Date": date_old}))
+                         .append(pd.DataFrame({"Date": date_new}))
+                         .sort_values("Date")
+                         .fillna(method="bfill")
+                         .fillna(method="ffill")
+                         ).set_index("Date")
+
+    df_temp_pchip = (df_select_cluster[["Monthly_Average_WTE", "Cluster_Label"]]
+                     .resample('MS')
+                     .interpolate('pchip')
+                     .rename(columns={'Monthly_Average_WTE':'WTE'})
+                     )
+    df_pchip = df_pchip.append(df_temp_pchip)
+    
+    # Rolling window on df_temp_pchip
+    df_temprolling1 = df_temp_pchip.rolling(RWM1, center=True).mean().dropna()#.reset_index()#.fillna(method="bfill").fillna(method="ffill")
+    df_temprolling2 = df_temp_pchip.rolling(RWM2, center=True).mean().dropna()#.reset_index()#.fillna(method="bfill").fillna(method="ffill")
+    df_temprolling3 = df_temp_pchip.rolling(RWM3, center=True).mean().dropna()#.reset_index()#.fillna(method="bfill").fillna(method="ffill")    
+    df_RW1 = df_RW1.append(df_temprolling1)
+    df_RW2 = df_RW2.append(df_temprolling2)
+    df_RW3 = df_RW3.append(df_temprolling3)
+    
+    #scipy UnivariateSpline
+    df_spl_temp = df_ts[df_ts["Cluster_Label"] == cluster].resample('D', on='Date').mean().dropna(subset=['WTE'])
+    interp_index: DatetimeIndex = pd.date_range(start=min(df_spl_temp.index),freq='MS', end=max(df_spl_temp.index))
+    x = df_spl_temp.index.view('int')
+    xs = interp_index.view('int')
+    y = df_spl_temp["WTE"]
+    spl = UnivariateSpline(x, y)
+    spl.set_smoothing_factor(smooth_factor)
+    ynew = spl(xs)
+    df_spl_interp = pd.DataFrame({"Date":interp_index, "WTE":ynew})
+    df_spl_interp["Cluster_Label"] = cluster
+    df_spl_interp = df_spl_interp.set_index("Date") 
+    df_spl = df_spl.append(df_spl_interp)
+    
+    #scipy UnivariateSpline with std removal
+    df_spl_std_temp = df_ts_std[df_ts_std["Cluster_Label"] == cluster].resample('D').mean().dropna(subset=['WTE'])
+    interp_index: DatetimeIndex = pd.date_range(start=min(df_spl_std_temp.index),freq='MS', end=max(df_spl_std_temp.index))
+    x = df_spl_std_temp.index.view('int')
+    xs = interp_index.view('int')
+    y = df_spl_std_temp["WTE"]
+    spl = UnivariateSpline(x, y)
+    spl.set_smoothing_factor(smooth_factor)
+    ynew = spl(xs)
+    df_spl_std_interp = pd.DataFrame({"Date":interp_index, "WTE":ynew})
+    df_spl_std_interp["Cluster_Label"] = cluster
+    df_spl_std_interp = df_spl_std_interp.set_index("Date")
+    df_spl_std = df_spl_std.append(df_spl_std_interp)
+    
+    # Comparing the WTE range of the rolling window (RW3) and SPL and choosing the one with smaller range
+    delta_rw = df_temprolling3["WTE"].max() - df_temprolling3["WTE"].min()
+    delta_spl = df_spl_std_interp["WTE"].max() - df_spl_std_interp["WTE"].min()
+    if delta_rw < delta_spl:
+        df_temprolling3["Method"] = "RW"
+        df_wte = df_wte.append(df_temprolling3)
+    elif delta_rw > delta_spl:
+        df_spl_std_interp["Method"] = "SPL"
+        df_wte = df_wte.append(df_spl_std_interp)
+    
+  
+df_pchip = df_pchip.rename(columns={"Monthly_Average_WTE":"PCHIP_WTE"})
+df_RW1 = df_RW1.rename(columns={"WTE":f"{RWM1}M_RW_WTE"})
+df_RW2 = df_RW2.rename(columns={"WTE":f"{RWM2}M_RW_WTE"})
+df_RW3 = df_RW3.rename(columns={"WTE":f"{RWM3}M_RW_WTE"})
+
+df_RW1 = df_RW1.reset_index()
+df_RW1 = df_RW1.rename(columns={'index': 'Date'}) 
+df_RW2 = df_RW2.reset_index()
+df_RW2 = df_RW2.rename(columns={'index': 'Date'})   
+df_RW3 = df_RW3.reset_index()
+df_RW3 = df_RW3.rename(columns={'index': 'Date'})
+df_spl = df_spl.reset_index()
+df_spl = df_spl.rename(columns={'index': 'Date'})
+df_spl_std = df_spl_std.reset_index()
+df_spl_std = df_spl_std.rename(columns={'index': 'Date'})
+#%% Creating the universal date x-index
+#date_start_all = (df_ts_std.index.min()).replace(day=1)
+date_start_all = "1980-01-01"
+date_end_all = (df_ts_std.index.max() + DateOffset(months=1)).replace(day=1)
+#Setting the basemap using the grid outter boundary.
+plot=True
+save = False
+if plot:
+    basemap = basemap.to_crs(crs=4326)
+    aquifermap = aquifermap.to_crs(crs=4326)
+    gdf_uni_wells_clip = gdf_uni_wells_clip.to_crs(crs=4326)
+    gdf_cluster_label = gdf_cluster_label.to_crs(crs=4326)
+    gdf_cluster_label_clip = gdf_cluster_label_clip.to_crs(crs=4326)
+    
+    #for cluster in list_cluster_label:
+    for cluster in [58,3]:#,55]:
+      df_daily_plot = df_ts[df_ts['Cluster_Label'] == cluster]
+      df_daily_std_plot = df_ts_std[df_ts_std['Cluster_Label'] == cluster]
+      df_monthly_plot = df_monthly[df_monthly['Cluster_Label'] == cluster]
+      df_pchip_plot = df_pchip[df_pchip['Cluster_Label'] == cluster]
+      df_RW_plot1 = df_RW1[df_RW1['Cluster_Label'] == cluster]
+      df_RW_plot2 = df_RW2[df_RW2['Cluster_Label'] == cluster]
+      df_RW_plot3 = df_RW3[df_RW3['Cluster_Label'] == cluster]
+      df_spl_plot = df_spl[df_spl['Cluster_Label'] == cluster]
+      df_spl_std_plot = df_spl_std[df_spl_std['Cluster_Label'] == cluster]
+      points_daily = len(df_daily_std_plot)
+      points_monthly = len(df_monthly_plot)
+      
+      date_start = (df_daily_std_plot.index.min()).strftime("%Y-%m-%d")
+      date_end = (df_daily_std_plot.index.max()).strftime("%Y-%m-%d")
+    
+      fig, ax = plt.subplots(figsize=(10,5))
+      #ax.set_aspect('equal')
+      df_daily_plot.plot(ax=ax, x="Date", y="WTE", style = ('o'), ms=3, color="blue" ,label="Wells")
+      #df_daily_std_plot["WTE"].plot(ax=ax, style = ('o'), ms=3, label="Wells_Std")
+      #df_monthly_plot.plot(ax=ax,x="Date", y="Monthly_Average_WTE", style = "x", ms=9, color="blue", label="Monthly WTE")
+      #df_pchip_plot.plot(ax=ax, y='WTE', linestyle = ":" , lw=1, color="k", label="PCHIP")
+      #df_RW_plot1.plot(ax=ax, x='Date', y=f"{RWM1}M_RW_WTE", lw=1, color="g", label=f"{RWM1}M RW")
+      #df_RW_plot2.plot(ax=ax, x='Date', y=f"{RWM2}M_RW_WTE", lw=1, color="b", label=f"{RWM2}M RW")
+      df_RW_plot3.plot(ax=ax, x='Date', y=f"{RWM3}M_RW_WTE", lw=3, color="r", label=f"{RWM3}M RW")
+      #df_spl_plot.plot(ax=ax, x='Date', y="WTE", lw=2, linestyle = "-", color="y", label="SPL")
+      df_spl_std_plot.plot(ax=ax, x='Date', y="WTE", lw=3, linestyle = "-.", color="k", label="SPL_Std")
+      plt.title(f'Cluster Label: {cluster}|  Cluster Size: {min_wells_in_cluster} Cluster\n'
+                f'Date: {date_start} to {date_end}|  RW Size: {RWM3} months\n'
+                 f'SPL: {points_daily} points|  Rolling Windows: {points_monthly} points'
+                 )
+      plt.xlim([date_start_all, date_end_all])
+      ax.xaxis.set_major_locator(mdates.YearLocator(base=5))
+      ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))     
+      plt.show()
+    # =============================================================================
+    #   xmin = df_daily_std_plot["Date"].min().replace(day=1)
+    #   xmax = df_daily_std_plot["Date"].max().replace(day=1)
+    #   plt.xlim([xmin, xmax])
+    #   plt.show()
+    #   del ax
+    # =============================================================================
+    
+
+    
+      if save:
+          fig1, ax = plt.subplots(figsize=(10,10))
+          ax.set_aspect('equal')
+          base = basemap.plot(ax=ax, color='white', edgecolor='black')
+          selected_clusterplot = gdf_uni_wells_clip[gdf_uni_wells_clip['Cluster_Label'] == cluster]
+          #display(clusterplot)
+          selected_clusterplot.plot(ax=ax, markersize=6)
+        
+          selected_gdf_cluster_label = gdf_cluster_label[gdf_cluster_label['Cluster_Label'] == cluster]
+          selected_gdf_cluster_label.plot(ax=ax, color='red',marker='o', markersize=30)
+          plt.title(f'Cluster Label: {cluster}|  Cluster Size: {min_wells_in_cluster} Cluster\n'
+                    f'Date: {date_start} to {date_end}|  RW Size: {RWM3} months\n'
+                     f'SPL: {points_daily} points|  Rolling Windows: {points_monthly} points'
+                    ) 
+          plt.show()
+          
+          pp = PdfPages(f'./Result_Fig/Niger_Cluster_10000000spl_{min_wells_in_cluster}dp_{RWM3}RW.pdf')
+          pp.savefig(smallaquiferfig)
+          pp.savefig(fig1)
+          pp.savefig(fig)
+          pp.close()
+    
+    #Reference: How to save plots into a single PDF
+    #https://www.delftstack.com/howto/matplotlib/how-to-save-plots-as-pdf-file-in-matplotlib/
+
+#%%#============================From here=================================
+#  SETTING UP FOR SPATIAL INTERPOLATION AND GROUNDWATER STORAGE CALCULATION
+df_matrix = pd.pivot_table(df_wte, index=df_wte.index.values, values = "WTE", columns="Cluster_Label")
+df_well_locations = (gdf_cluster_label[["Cluster_Label","Cluster_Lat","Cluster_Lon"]].set_index("Cluster_Label")
+                     .rename(columns={"Cluster_Lon":"Longitude","Cluster_Lat":"Latitude"})
+                     )
+
+#==================================FROM HERE======================================
+#Spatial Interpolation
+well_data = df_matrix
+x_coordinates = df_well_locations["Longitude"]
+y_coordinates = df_well_locations["Latitude"]
+
+data_root = "/Users/rennishimura/Downloads/NetCDF" # Data Locations (I currently set it to my Downloads folder and its subfolder "NetCDF")
+figures_root = './Figures Spatial' # Location where figures are saved
+netcdf_filename = f'NIGER_KCLUSTER_{min_wells_in_cluster}Members.nc' # Naming netcdf output
+skip_month = 12 # Time interval of netcdf, published value 48 recomended 1.
+x_cells =  None # Specify resolution based on number of cells along the x-axis
+y_cells = None # Specify resolution based on number of cells along the y-axis
+res = None # Specify resolution without reference to number of cells in shape
+
+# =============================================================================
+# filepath = data_root + '/' + netcdf_filename
+# if os.path.exists(filepath):
+#     os.remove(filepath)
+# =============================================================================
+
+# Initiate class creating data and figure folder
+inter = utils_spatial.krigging_interpolation(data_root, figures_root)
+
+# Load respective aquifer shape file
+polygon = inter.Shape_Boundary('/Users/rennishimura/Documents/!Research/Pseudo_Wells_QGIS/Aquifer/Small_South_Aquifer/Niger_Small_South.shp')
+
+# Line creates grid and mask based on the bounding box of the aquifer
+# Grid is created based on resolution determined by x_cells, y_cells or res
+# where priority is x_cells > y_cells > res. 
+grid_long, grid_lat = inter.create_grid_polygon(polygon, x_cells = x_cells, y_cells = y_cells, res = res, plot=False)
+#
+#================OPTION PARAMETER=======================
+# Extract/filter data based on:
+# 1 = "Date"
+# 2 = "Minimum Number of Wells"
+param = 1
+#================OPTION PARAMETER=======================
+if param == 1: 
+    start_date = "1985-01-01"
+    end_date = "2015-01-01"
+    data_subset = inter.extract_dataframe_data(well_data, skip_month).loc[start_date: end_date]
+    data_subset["Wells"] = data_subset.count(axis=1)
+    data_subset = data_subset[data_subset["Wells"] >=1].drop("Wells", 1)
+    data_check = pd.DataFrame(data_subset.count(axis=1), index=data_subset.index, columns=["# of Wells"]) 
+    data_check.plot(y="# of Wells")
+    # fill nan values of data_subset with foward and back fills
+    data_subset = data_subset.fillna(method="bfill").fillna(method="ffill")
+elif param == 2:
+    data_subset = inter.extract_dataframe_data(well_data, skip_month)
+    data_subset["Wells"] = data_subset.count(axis=1)
+    data_subset = data_subset[data_subset["Wells"] >=1].drop("Wells", 1)
+    data_check = pd.DataFrame(data_subset.count(axis=1), index=data_subset.index, columns=["# of Wells"]) 
+    data_check.plot(y="# of Wells")
+    # fill nan values of data_subset with foward and back fills
+    data_subset = data_subset.fillna(method="bfill").fillna(method="ffill")
+plt.show()
+
+# This sets up a netcdf file to store each raster in.
+file_nc, raster_data = inter.netcdf_setup(grid_long, grid_lat, data_subset.index, netcdf_filename)
+
+# Loop through each date, create variogram for time step create krig map.
+# Inserts the grid at the timestep within the netCDF.
+for i, date in enumerate(data_subset.index):
+    # Filter values associated with step
+    values = data_subset.loc[data_subset.index[i]].dropna()
+
+    # fit the model variogram to the experimental variogram
+    var_fitted = inter.fit_model_var(x_coordinates.loc[values.index], 
+                                     y_coordinates.loc[values.index], 
+                                     values.values, 
+                                     influence = 0.10,
+                                     plot=False)  # fit variogram
+    # when kriging, you need a variogram. The subroutin has a function to plot
+    # the variogram and the experimental. Variable 'influence' is the percentage
+    # of the total aquifer length where wells are correlated. set 0.1 - 0.2
+
+    krig_map = inter.krig_field(var_fitted, x_coordinates.loc[values.index], y_coordinates.loc[values.index], 
+                                values.values, grid_long, grid_lat, date, plot=False) # krig data
+    # krig_map.field provides the 2D array of values
+    # this function does all the spatial interpolation using the variogram from above.
+    # Removes all data outside of boundaries of shapefile.
+
+    # write data to netcdf file
+    raster_data[i,:,:] = krig_map.field  # add kriged field to netcdf file at time_step
+
+file_nc.close()
+
+print('NetCDF Created.')
+#%%
+#==================================FROM HERE======================================    
+# STORAGE CHANGE CALCULATION AND GRACE COMP (WHEN BECOMES AVAILABLE)
+# Calculating storage depletion curve
+data_root = "/Users/rennishimura/Downloads/NetCDF/"
+raster_file =  f'NIGER_KCLUSTER_{min_wells_in_cluster}Members.nc' # Naming netcdf output
+#raster_file = f"NIGER_KCLUSTER_100Members.nc"
+
+# Calculate storage depletion curve**
+# Specify system of measurement for imputed data*
+units = "English" #@param ["English", "Metric"]
+
+if units == "Metric": 
+  unit_coeff, area_coeff, vol_coeff, area_lab, vol_lab = 0.3048, 1, 1000, 'km^2', 'km^3'
+else: 
+  unit_coeff, area_coeff, vol_coeff, area_lab, vol_lab = 1, 43560, 1, 'million acres', 'million ac-ft'
+
+#Specify the storage coefficient of the aquifer*
+# +++++++++++++++++++++++++++++++++++++++
+storage_coefficient = 0.15 #+++++++++++++
+# +++++++++++++++++++++++++++++++++++++++
+
+imputed_raster = nc.Dataset(data_root + raster_file)
+
+# Calculate the area of the aquifer
+yRes = abs(round(imputed_raster['lat'][0] - imputed_raster['lat'][1], 7)) # this assumes all cells will be the same size in one dimension (all cells will have same x-component)
+xRes = abs(round(imputed_raster['lon'][0] - imputed_raster['lon'][1], 7))
+area = 0
+# Loop through each y row
+for y in range(imputed_raster.dimensions['lat'].size):
+  # Define the upper and lower bounds of the row
+  mylatmax = math.radians(imputed_raster['lat'][y] + (yRes/2))
+  mylatmin = math.radians(imputed_raster['lat'][y] - (yRes/2))
+
+  # Count how many cells in each row are in aquifer (i.e. and, therefore, not nan)
+  xCount = 0
+  for x in range(imputed_raster.dimensions['lon'].size):
+    if not math.isnan(imputed_raster['tsvalue'][0, y, x]):
+      xCount += 1
+  
+  # Area calculated based on the equation found here: https://www.pmel.noaa.gov/maillists/tmap/ferret_users/fu_2004/msg00023.html
+  #     (pi/180) * R^2 * |lon1-lon2| * |sin(lat1)-sin(lat2)| 
+  #     radius is 3958.8 mi
+  area += ((3958.8 * 5280 * unit_coeff)**2 * math.radians(xRes * xCount) 
+           * abs((math.sin(mylatmin) - math.sin(mylatmax)))
+           )
+print("The area of the aquifer is %.2f %s.\n" %(area / 10**6 / area_coeff, area_lab))
+
+# Calculate total drawdown volume at each time step
+drawdown_grid = np.zeros((imputed_raster.dimensions['time'].size, imputed_raster.dimensions['lat'].size, imputed_raster.dimensions['lon'].size))
+drawdown_volume = np.zeros(imputed_raster.dimensions['time'].size)
+for t in range(imputed_raster.dimensions['time'].size):
+  drawdown_grid[t, :, :] = imputed_raster['tsvalue'][t, :, :] - imputed_raster['tsvalue'][0, :, :] # Calculate drawdown at time t by subtracting original WTE at time 0
+  drawdown_volume[t] = np.nanmean(drawdown_grid[t, :, :] * storage_coefficient * area ) # Average drawdown across entire aquifer * storage_coefficient * area of aquifer
+
+# Plot storage depletion curve
+x_data = pd.Series(imputed_raster['time'][:], dtype=int).apply(lambda x: dt.datetime.fromordinal(x)) # Convert from days since 0001-01-01 00:00:00
+y_data = drawdown_volume / 10**6 / area_coeff / vol_coeff
+xy_data = pd.DataFrame(y_data, index=x_data)
+plt.plot(x_data, y_data)
+plt.xlabel("Year")
+plt.ylabel("Drawdown Volume (%s)" %(vol_lab))
+plt.title("Storage Depletion Curve")
+plt.show()
+#
+# GRACE Comparison
+grace_file = '/Users/rennishimura/Downloads/grace_niger_small_south.csv'
+GRACE = pd.read_csv(grace_file)
+
+#@markdown ### **Specify paramters and run the cell to create comparison plot of GRACE and imputed data**
+
+#@markdown *Specify what year to start plotting the imputed data (will round to closest date) or start at same date as GRACE*
+start_date = "1990-01-01" #@param {type:"date"}
+match_GRACE = False  #@param {type:"boolean"}
+#@markdown *Specify any identifying parameters you would like to include in the title of the plot*
+plot_title = f"Minimum Cluster Size: {size_min} | {storage_coefficient} storage coeff" #@param {type:"string"}
+
+# Set up time series data from imputed drawdown volume and GRACE
+x2 = GRACE['Date'].apply(lambda x: dt.datetime.fromtimestamp(x/1000))  # milliseconds since epoch converted to date
+y2 = GRACE['Groundwater Storage (Calculated)'][0:] - GRACE['Groundwater Storage (Calculated)'][0]  # water level equivalent in cm
+#y2 = GRACE['Groundwater Storage (Calculated NOAH .25)'][0:] - GRACE['Groundwater Storage (Calculated NOAH .25)'][0]  # water level equivalent in cm
+x2_start = x2[0]
+
+# Select the appropriate subset of the imputed data
+if match_GRACE: date = x2[0]
+else: date = dt.datetime.strptime(start_date, '%Y-%m-%d')
+closest_date = min(x_data, key=lambda x: abs(x - date))
+start_index = x_data[x_data == closest_date].index[0]
+x1 = x_data[start_index:]
+# Getting the closest GRACE start date from the .nc file (x_data)
+closest_date1 = min(x_data, key=lambda x: abs(x - x2_start))
+start_index1 = x_data[x_data == closest_date1].index[0]
+y1 = ( drawdown_volume[start_index:] - drawdown_volume[start_index1] ) / area * (0.3048/unit_coeff) * 100 # water level equivalent in cm
+
+xy_var = pd.DataFrame(y1, index=x1)
+xy_grace = pd.DataFrame(y2.values, index=x2)
+
+# Create plot
+plt.plot(x1,y1, label="Imputed Data")
+plt.plot(x2,y2, label="GRACE")
+plt.xlabel("Year")
+plt.ylabel("Liquid Water Equivalent Thickness (cm)")
+plt.legend()
+plt.title('GRACE COMPARISON\n'+plot_title)
+plt.savefig('GRACE_comp_'+str(storage_coefficient)+'.png')
+plt.show()
+    
+#%% Plotting each pseudo-well's WTE time series
+testfig, ax = plt.subplots(figsize=(20,20))
+list_cluster = [int(x) for x in df_wte["Cluster_Label"].unique()]
+#list_cluster = [int(x) for x in list_cluster]
+for cluster in list_cluster:
+    df_wte_group = (df_wte[df_wte["Cluster_Label"] == cluster])
+    ax=df_wte_group[["WTE"]].plot(ax=ax, legend=False)
+#ax.legend(list_cluster, fontsize=24)
+plt.xlim(xmin="1985-01-01")
+plt.title(f"Minimum Cluster Size: {size_min}", fontsize=60)
+plt.xticks(fontsize=30)
+plt.yticks(fontsize=30)
+
+#%% Show maps of pseudo wells and their boundaries
+smallaquiferfig, ax = plt.subplots(figsize=(9,9))
+#aquifermap_buffered.plot(ax=ax, color='blue')
+aquifermap.plot(ax=ax, color="white")
+aquifermap.boundary.plot(ax=ax, color="black")
+
+gdf_ts_clip.plot(ax=ax, column="Cluster_Label", cmap="nipy_spectral", markersize=9)
+
+gdf_cluster_label_clip["Cluster_Label1000"] = gdf_cluster_label_clip["Cluster_Label"]*1000
+#gdf_cluster_label_clip.plot(ax=ax,column="Cluster_Label", cmap="Accent", markersize=60)
+gdf_cluster_label_clip.plot(ax=ax, facecolor="red", edgecolor="black", markersize=60)
+
+list_convex_hull = gpd.GeoSeries()
+#gdf_convex_hull = gpd.GeoDataFrame()
+for cluster in list_cluster_label:
+    temp_gdf_ts_clip = gdf_ts[gdf_ts["Cluster_Label"] == cluster]
+    
+    convex_hull = temp_gdf_ts_clip.geometry.unary_union.convex_hull
+    series_convex_hull = gpd.GeoSeries(convex_hull, name="geometry")
+    #series_convex_hull.plot(ax=ax, facecolor="none", edgecolor="grey")
+    list_convex_hull = list_convex_hull.append(series_convex_hull)
+    #gdf_convex_hull = gdf_convex_hull.append(series_convex_hull, ignore_index=True)
+gdf_convex_hull = gpd.GeoDataFrame(geometry=list_convex_hull, crs=4326)
+gdf_convex_hull.plot(ax=ax, facecolor="none", edgecolor="black")
+
+num_pwells_clip = len(gdf_cluster_label_clip)
+plt.title(f'Number of Pseudo-Wells: {num_pwells_clip}\n'
+          f'Minimum Cluster Size: {size_min} wells',
+          fontsize=18
+          ) 
+plt.show()
+#%%
+gdf_uni_wells_clip_size = pd.DataFrame(gdf_uni_wells_clip.groupby("Cluster_Label").size(), columns=["Wells in Cluster"] )
+gdf_cluster_label_new = pd.merge(gdf_cluster_label, gdf_uni_wells_clip_size, left_on="Cluster_Label", right_index=True)
+gdf_cluster_label_new = (gdf_cluster_label_new[["Cluster_Label","Cluster_Lat","Cluster_Lon","Wells in Cluster"]]
+                         .set_index("Cluster_Label")
+                         )
+#%% Saving the files to a local disk.
+# Reproject all the layers to WGS84 (ESPG: 4326) to upload to QGIS for a visual representation.
+gdf_ts = gdf_ts.to_crs(4326)
+gdf_cluster_label = gdf_cluster_label.to_crs(4326)
+#Downloading dataframe as csv files
+CSV = False
+GeoJason = False
+
+# Creating csv files to upload to the GWDM
+if CSV == True:
+  #gdf_ts.to_csv('Cluster_Original_Time_Series.csv')
+  #gdf_uni_wells_clip.to_csv("Original_Well＿locations.csv")
+  df_cluster_label["Cluster_Name"] = df_cluster_label["Cluster_Label"].astype(str)
+  df_cluster_label["Pseudo_GSE"] = -9999
+  df_cluster_label.to_csv(f"./csv/Pseudo_Wells_Locations_{size_min}-{min_wells_in_cluster}-ver2_.csv")
+  
+  df_wte["Cluster_Label"] = df_wte["Cluster_Label"].astype(str)
+  df_wte.to_csv(f'./csv/Cluster_WTE_Measurements_{size_min}-{min_wells_in_cluster}-ver2_.csv' )
+  #df_RW3.to_csv(f"{RWM3}M_WTE_Measurements.csv")
+
+#Creating GeoJSON files to upload to QGIS
+if GeoJason == True:
+  gdf_cluster_label.to_file("Pseudo_Wells.geojson", driver="GeoJSON")
+  gdf_ts.to_file("Measurement_Wells.geojson", driver="GeoJSON")
+  #paquifer.to_file("Pseudo_Aquifer.geojson", driver="GeoJSON")
+
